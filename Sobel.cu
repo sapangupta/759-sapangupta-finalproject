@@ -80,8 +80,8 @@ __global__ void ConvolutionKernel(Matrix M, Matrix N, Matrix P)
     int hB = N.height;
     int wB = N.width;
 
-    if(threadIdx.x < 5 && threadIdx.y < 5) {
-        s[threadIdx.y * 5 + threadIdx.x] = M.elements[threadIdx.y * 5 + threadIdx.x];
+    if(threadIdx.x < 3 && threadIdx.y < 3) {
+        s[threadIdx.y * 3 + threadIdx.x] = M.elements[threadIdx.y * 3 + threadIdx.x];
     }
 
     __syncthreads();
@@ -130,8 +130,11 @@ int main(int argc, char** argv) {
     }
 
     int size = atoi(argv[1]);
-    M  = AllocateMatrix(KERNEL_SIZE, KERNEL_SIZE,1);
-    N  = AllocateMatrix(size, size,1);
+    M  = AllocateKernelMatrix(KERNEL_SIZE, KERNEL_SIZE,1);
+
+    N  = AllocateFrameMatrix(size, size,1);
+
+    // 0 is just allocation no init
     P  = AllocateMatrix(size, size,0);
     float cpuTime = 0.f,gpuTime=0.f;
 
@@ -182,6 +185,7 @@ void ConvolutionOnDevice(const Matrix M, const Matrix N, Matrix P)
     // Load M and N to the device
     Matrix Md = AllocateDeviceMatrix(M);
     CopyToDeviceMatrix(Md, M);
+
     Matrix Nd = AllocateDeviceMatrix(N);
     CopyToDeviceMatrix(Nd, N);
 
@@ -216,7 +220,7 @@ Matrix AllocateDeviceMatrix(const Matrix M)
     return Mdevice;
 }
 
-Matrix AllocateMatrix(int height, int width,int init) // 1 is file read/ 0 is just allocation
+Matrix AllocateKernelMatrix(int height, int width,int init) // 1 is file read/ 0 is just allocation
 {
     Matrix M;
     M.width = M.pitch = width;
@@ -224,7 +228,31 @@ Matrix AllocateMatrix(int height, int width,int init) // 1 is file read/ 0 is ju
     int size = M.width * M.height;
     M.elements = NULL;
     FILE *fp;
-    fp = fopen("problem1.inp","r");
+    fp = fopen("kernel.inp","r");
+    // don't allocate memory on option 2
+
+    M.elements = (float*) malloc(size*sizeof(float));
+    if(init)
+    {
+        for(unsigned int i = 0; i < M.height * M.width; i++)
+        {
+            fscanf(fp,"%f",&M.elements[i]);
+        }
+    }
+    return M;
+}
+
+Matrix AllocateFrameMatrix(int height, int width,int init) // 1 is file read/ 0 is just allocation
+{
+    Matrix M;
+    M.width = M.pitch = width;
+    M.height = height;
+    int size = M.width * M.height;
+    M.elements = NULL;
+    FILE *fp;
+
+    fp = fopen("frame.inp","r");
+
     // don't allocate memory on option 2
 
     M.elements = (float*) malloc(size*sizeof(float));
