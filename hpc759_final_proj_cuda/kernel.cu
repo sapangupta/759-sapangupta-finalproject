@@ -11,6 +11,8 @@
 #include <string>
 #include <stdio.h>
 #include <math.h>
+#include <chrono>
+#include <numeric>
 
 using namespace cv;
 using namespace std;
@@ -105,7 +107,6 @@ __global__ void applyFiltersSobel(uchar* d_input, const size_t cols, const size_
 		const int r = (kernel_width - 1) / 2;
 		int sum_x = 0;
 		int sum_y = 0;
-		int sum = 0;
 
 		for (int i = -r; i <= r; ++i)
 		{
@@ -366,7 +367,15 @@ int loadVideo() {
 	cout << "Frames per second: " << fps << endl;
 	namedWindow("ThisVideo", CV_WINDOW_NORMAL);
 
+	vector<float> v_fps;
+	float count_fps = 0;
+	auto t_start = std::chrono::high_resolution_clock::now();
 	while (1) {
+
+		if (count_fps == 0.0) {
+			t_start = std::chrono::high_resolution_clock::now();
+		}
+
 		Mat colorframe;
 		capVideo >> colorframe;
 		if (colorframe.empty()) {
@@ -394,6 +403,9 @@ int loadVideo() {
 		unsigned char *new_frame =  invokeKernel(&frameArray[0], frame.rows, frame.cols);
 		Mat modified_frame(frame.rows, frame.cols, frame.type(), new_frame, frame.step);
 
+		/*Mat modified_frame;
+		Canny(frame, modified_frame, 35, 90);*/
+
 
 		//mVideo << modified_frame;
 
@@ -412,9 +424,25 @@ int loadVideo() {
 
 		imshow("ThisVideo", canvas);
 
+		auto t_end = std::chrono::high_resolution_clock::now();
+
+		//cout << endl << std::chrono::duration<double, std::milli>(t_end - t_start).count();
+		if (std::chrono::duration<double, std::milli>(t_end - t_start).count() < 10000) {
+			count_fps++;
+		}
+		else {
+			v_fps.push_back(count_fps/10);
+			count_fps = 0;
+		}
+
 		int keyPressed = waitKey(3);
 		if (keyPressed == 27) {
+			cout << endl;
+			std::vector<float> v{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+			//cout << "Frame rate achieved : " << std::accumulate(v.begin(), v.end(), 0.0) / v.size() << endl;
+			cout << "Frame rate achieved : " << std::accumulate(v_fps.begin(), v_fps.end(), 0.0) / v_fps.size() << endl;
 			cout << "ESC pressed" << endl;
+			waitKey(0);
 			break;
 		}
 		else if (keyPressed != -1) {
@@ -546,8 +574,8 @@ unsigned char* invokeKernel(unsigned char *frame, int rows, int cols) {
 																										  d_out_sobel_x, d_out_sobel_y, d_out_sobel_grad);
 	cuSuppressNonMax << <blocksPerGrid, threadsPerBlock>> > (d_out_sobel_grad, d_out_sobel_x, d_out_sobel_y,
    														   d_out_suppress, rows, cols);
-	cuHysteresisHigh << <blocksPerGrid, threadsPerBlock >> > (d_out_hys_high, d_out_suppress, d_strong_edge_mask, 50, rows, cols);
-	cuHysteresisLow << <blocksPerGrid, threadsPerBlock >> > (d_out_hys_low, d_out_hys_high, d_strong_edge_mask, 1, rows, cols);
+	cuHysteresisHigh << <blocksPerGrid, threadsPerBlock >> > (d_out_hys_high, d_out_suppress, d_strong_edge_mask, 90, rows, cols);
+	cuHysteresisLow << <blocksPerGrid, threadsPerBlock >> > (d_out_hys_low, d_out_hys_high, d_strong_edge_mask, 35, rows, cols);
 
 	// Check for any errors launching the kernel
 	cudaStatus = cudaGetLastError();
