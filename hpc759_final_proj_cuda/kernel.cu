@@ -15,8 +15,8 @@
 #include <chrono>
 #include <numeric>
 
-#define batch_size 72
-#define delay 500
+#define batch_size 1
+#define delay 1
 
 
 using namespace cv;
@@ -27,7 +27,7 @@ __constant__ int c_sobel_x[3][3];
 __constant__ int c_sobel_y[3][3];
 __constant__ int c_gaussian[5][5];
 
-
+const string window_name = "This";
 struct dev_mats {
 	unsigned char *d_frame, *d_out_gaussian, *d_out_suppress, *d_out_sobel_grad, *d_out_hys_high, *d_out_hys_low;
 	int *d_out_sobel_x, *d_out_sobel_y, *d_strong_edge_mask;
@@ -53,7 +53,7 @@ int gaussian[5][5] = {
 };
 
 
-int loadVideo();
+int loadVideo(string path);
 void invokeKernel(unsigned char* in_frame, unsigned char* out_frame, struct dev_mats &vec_dev_mat, int rows, int cols, cudaStream_t &stream);
 
 
@@ -339,18 +339,22 @@ void setConvolutionKernelsInDeviceConstantMem() {
 
 int main(int argc, char** argv)
 {	
-	cout << "OpenMP max threads : " << omp_get_max_threads() << endl;
+	if (argc <= 1) {
+		std::cout << "No CLI argument provided.";
+		exit(1);
+	}
+	string path = argv[1];
+
 	setConvolutionKernelsInDeviceConstantMem();
-	loadVideo();
+	
+	loadVideo(path);
 	return 0;
 }
 
 
 
 
-int loadVideo() {
-	string path = "C:/Users/sapan/Downloads/The Secret Life Of Walter Mitty.mp4";
-
+int loadVideo(string path) {
 	cudaStream_t streams[batch_size];
 	for (int i = 0; i < batch_size; i++) {
 		cudaStreamCreate(&streams[i]);
@@ -366,7 +370,6 @@ int loadVideo() {
 
 	Size S = Size((int)capVideo.get(CV_CAP_PROP_FRAME_WIDTH),    // Acquire input size
 		(int)capVideo.get(CV_CAP_PROP_FRAME_HEIGHT));
-
 	int ex = static_cast<int>(capVideo.get(CV_CAP_PROP_FOURCC));
 
 	//VideoWriter bVideo, gVideo, rVideo, mVideo;
@@ -385,11 +388,13 @@ int loadVideo() {
 	double currentTime = startTime;
 	capVideo.set(CV_CAP_PROP_POS_MSEC, startTime);
 	cout << "Frames per second: " << fps << endl;
-	namedWindow("ThisVideo", CV_WINDOW_NORMAL);
+	
 
 	vector<float> v_fps;
 	float count_fps = 0;
+	float count_fps1 = 0;
 	auto t_start = std::chrono::high_resolution_clock::now();
+	auto t_start1 = std::chrono::high_resolution_clock::now();
 
 	vector<Mat> prev_in_frame_q;
 	vector<unsigned char*> proc_q;
@@ -399,10 +404,16 @@ int loadVideo() {
 	vector<Mat> in_frame_q;
 
 	int flag = 0;
+	int frame_empty = 0;
+	namedWindow(window_name, CV_WINDOW_NORMAL);
 	while (1) {
 
 		if (count_fps == 0.0) {
 			t_start = std::chrono::high_resolution_clock::now();
+		}
+
+		if (count_fps1 == 0.0) {
+			t_start1 = std::chrono::high_resolution_clock::now();
 		}
 
 		if (flag == 0) {
@@ -411,6 +422,7 @@ int loadVideo() {
 				Mat colorframe;
 				capVideo >> colorframe;
 				if (colorframe.empty()) {
+					frame_empty = 1;
 					break;
 				}
 
@@ -421,7 +433,9 @@ int loadVideo() {
 
 				out_frame_q[i] = new unsigned char[frame.rows * frame.cols]();
 			}
-			cout << "frames collected" << endl;
+			if (frame_empty == 1)
+				break;
+			//cout << "frames collected" << endl;
 		}
 
 		//gVideo << frame;
@@ -437,28 +451,36 @@ int loadVideo() {
 
 			invokeKernel(&i_frame[0], out_frame_q[i], vec_dev_mat[i], in_frame_q[i].rows, in_frame_q[i].cols, streams[i]);
 		}
-		cout << "kernel invoked" << endl;
+		//cout << "kernel invoked" << endl;
 
 		if (flag == 1) {
 			for (int i = 0; i < batch_size; i++) {
-				Mat modified_frame(in_frame_q[i].rows, in_frame_q[i].cols, in_frame_q[i].type(), proc_q[i], in_frame_q[i].step);
+				Mat canvas;
 				Mat grayBGR;
+				Mat modified_frame(in_frame_q[i].rows, in_frame_q[i].cols, in_frame_q[i].type(), proc_q[i], in_frame_q[i].step);
 				cvtColor(modified_frame, grayBGR, COLOR_GRAY2BGR);
 
 				Mat frames[2] = { prev_in_frame_q[i], grayBGR };
-				Mat canvas;
+
 				hconcat(frames, 2, canvas);
 
-
-				imshow("ThisVideo", grayBGR);
+				imshow(window_name, modified_frame);
 
 				auto t_end = std::chrono::high_resolution_clock::now();
-				if (std::chrono::duration<double, std::milli>(t_end - t_start).count() < 10000) {
+				if (std::chrono::duration<double, std::milli>(t_end - t_start).count() < 5000) {
 					count_fps++;
+					count_fps1++;
 				}
 				else {
-					v_fps.push_back(count_fps / 10);
+					v_fps.push_back(count_fps / 5);
+					cout << "Frame rate 5s achieved : " << std::accumulate(v_fps.begin(), v_fps.end(), 0.0) / v_fps.size() << endl;
 					count_fps = 0;
+				}
+				if (std::chrono::duration<double, std::milli>(t_end - t_start1).count() > 30000) {
+					cout << "Frame rate achieved : " << std::accumulate(v_fps.begin(), v_fps.end(), 0.0) / v_fps.size() << endl;
+				}
+				else {
+					count_fps1 = 0;
 				}
 
 				int keyPressed = waitKey(delay);
@@ -475,11 +497,8 @@ int loadVideo() {
 					cout << "Pressed=" << keyPressed << " : Forwarding the video by 60s" << endl;
 				}
 			}
-			cout << "frames rendered" << endl;
+			//cout << "frames rendered" << endl;
 		}
-
-		
-		
 
 //		unsigned char* i_frame = new unsigned char[rows*columns];
 //		memcpy(i_frame, frame.datastart, (frame.dataend - frame.datastart) * sizeof(unsigned char))
@@ -489,7 +508,6 @@ int loadVideo() {
 		in_frame_q.clear();
 
 		for (int i = 0; i < batch_size; i++) {
-
 			Mat colorframe;
 			capVideo >> colorframe;
 			if (colorframe.empty()) {
@@ -499,17 +517,15 @@ int loadVideo() {
 			Mat frame;
 			cvtColor(colorframe, frame, COLOR_BGR2GRAY);
 			in_colorframe_q.push_back(colorframe);
-			in_frame_q.push_back(frame);
-
-				
+			in_frame_q.push_back(frame);		
 		}
-		cout << "frames collected" << endl;
+		//cout << "frames collected" << endl;
 		
 		
 	
 
 		cudaDeviceSynchronize();
-		cout << "synchronized batch" << endl;
+		//cout << "synchronized batch" << endl;
 		proc_q.swap(out_frame_q);
 
 		out_frame_q.clear();
@@ -528,7 +544,7 @@ int loadVideo() {
 				out_frame_q[i] = new unsigned char[in_frame_q[i].rows * in_frame_q[i].cols]();
 		}
 		
-		cout << "synchronization complete" << endl;
+		//cout << "synchronization complete" << endl;
 
 		flag = 1;
 		/*Mat modified_frame;
