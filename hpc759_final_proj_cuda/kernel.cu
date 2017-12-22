@@ -10,9 +10,14 @@
 #include <iostream>
 #include <string>
 #include <stdio.h>
+#include <omp.h>
 #include <math.h>
 #include <chrono>
 #include <numeric>
+
+#define batch_size 72
+#define delay 500
+
 
 using namespace cv;
 using namespace std;
@@ -22,6 +27,11 @@ __constant__ int c_sobel_x[3][3];
 __constant__ int c_sobel_y[3][3];
 __constant__ int c_gaussian[5][5];
 
+
+struct dev_mats {
+	unsigned char *d_frame, *d_out_gaussian, *d_out_suppress, *d_out_sobel_grad, *d_out_hys_high, *d_out_hys_low;
+	int *d_out_sobel_x, *d_out_sobel_y, *d_strong_edge_mask;
+}dev_mats1;
 
 // convolution kernels
 int sobel_x[3][3] = {
@@ -44,7 +54,7 @@ int gaussian[5][5] = {
 
 
 int loadVideo();
-unsigned char* invokeKernel(unsigned char *frame, int rows, int cols);
+void invokeKernel(unsigned char* in_frame, unsigned char* out_frame, struct dev_mats &vec_dev_mat, int rows, int cols, cudaStream_t &stream);
 
 
 __global__ void applyFiltersGaussian(uchar* d_input, const size_t width, const size_t height, const int kernel_width, uchar* d_output)
@@ -329,14 +339,22 @@ void setConvolutionKernelsInDeviceConstantMem() {
 
 int main(int argc, char** argv)
 {	
+	cout << "OpenMP max threads : " << omp_get_max_threads() << endl;
 	setConvolutionKernelsInDeviceConstantMem();
 	loadVideo();
 	return 0;
 }
 
 
+
+
 int loadVideo() {
 	string path = "C:/Users/sapan/Downloads/The Secret Life Of Walter Mitty.mp4";
+
+	cudaStream_t streams[batch_size];
+	for (int i = 0; i < batch_size; i++) {
+		cudaStreamCreate(&streams[i]);
+	}
 
 	VideoCapture capVideo(path);
 	if (!capVideo.isOpened()) {
@@ -345,20 +363,22 @@ int loadVideo() {
 		return -1;
 	}
 
+
 	Size S = Size((int)capVideo.get(CV_CAP_PROP_FRAME_WIDTH),    // Acquire input size
 		(int)capVideo.get(CV_CAP_PROP_FRAME_HEIGHT));
+
 	int ex = static_cast<int>(capVideo.get(CV_CAP_PROP_FOURCC));
 
-	VideoWriter bVideo, gVideo, rVideo, mVideo;
-	gVideo.open("grey.avi", -1, capVideo.get(CV_CAP_PROP_FPS), S, true);
-	mVideo.open("modified.avi", -1, capVideo.get(CV_CAP_PROP_FPS), S, true);
+	//VideoWriter bVideo, gVideo, rVideo, mVideo;
+	//gVideo.open("grey.avi", -1, capVideo.get(CV_CAP_PROP_FPS), S, true);
+	//mVideo.open("modified.avi", -1, capVideo.get(CV_CAP_PROP_FPS), S, true);
 
-	if (!gVideo.isOpened() || !mVideo.isOpened())
-	{
-		cout << "Could not open the output video for write." << endl;
-		waitKey(0);
-		return -1;
-	}
+	//if (!gVideo.isOpened() || !mVideo.isOpened())
+	//{
+	//	cout << "Could not open the output video for write." << endl;
+	//	waitKey(0);
+	//	return -1;
+	//}
 
 	double fps = capVideo.get(CV_CAP_PROP_FPS);
 	double startTime = 70000;
@@ -370,39 +390,147 @@ int loadVideo() {
 	vector<float> v_fps;
 	float count_fps = 0;
 	auto t_start = std::chrono::high_resolution_clock::now();
+
+	vector<Mat> prev_in_frame_q;
+	vector<unsigned char*> proc_q;
+	vector<dev_mats> vec_dev_mat(batch_size);
+	vector<unsigned char*> out_frame_q(batch_size);
+	vector<Mat> in_colorframe_q;
+	vector<Mat> in_frame_q;
+
+	int flag = 0;
 	while (1) {
 
 		if (count_fps == 0.0) {
 			t_start = std::chrono::high_resolution_clock::now();
 		}
 
-		Mat colorframe;
-		capVideo >> colorframe;
-		if (colorframe.empty()) {
-			break;
+		if (flag == 0) {
+			for (int i = 0; i < batch_size; i++) {
+
+				Mat colorframe;
+				capVideo >> colorframe;
+				if (colorframe.empty()) {
+					break;
+				}
+
+				Mat frame;
+				cvtColor(colorframe, frame, COLOR_BGR2GRAY);
+				in_colorframe_q.push_back(colorframe);
+				in_frame_q.push_back(frame);
+
+				out_frame_q[i] = new unsigned char[frame.rows * frame.cols]();
+			}
+			cout << "frames collected" << endl;
 		}
 
-		Mat frame;
-		cvtColor(colorframe, frame, COLOR_BGR2GRAY);
-
-		/*cout << "Frame " << i << ": " << "flags: " << frame.flags << ", dims: " << frame.dims << ", rows-cols: "
-			<< frame.rows << "-" << frame.cols << ", isContinuous: " << frame.isContinuous() << ", type: " << frame.type()
-			<< ", channels: " << frame.channels() << ", total: " << frame.total() << ", elemSize: " << frame.elemSize() << ", step: "
-			<< frame.step << endl;*/
-
-		//cout << endl;
-	
 		//gVideo << frame;
+#pragma omp parallel for
+		for (int i = 0; i < batch_size; i++) {
+			vector<unsigned char> i_frame(in_frame_q[i].rows*in_frame_q[i].cols);
 
-		vector<unsigned char> frameArray(frame.rows*frame.cols);
-		if (frame.isContinuous()) {
-			frameArray.assign(frame.datastart, frame.dataend);
+			if (in_frame_q[i].isContinuous()) {
+				i_frame.assign(in_frame_q[i].datastart, in_frame_q[i].dataend);
+			}
+			else
+				continue;
+
+			invokeKernel(&i_frame[0], out_frame_q[i], vec_dev_mat[i], in_frame_q[i].rows, in_frame_q[i].cols, streams[i]);
+		}
+		cout << "kernel invoked" << endl;
+
+		if (flag == 1) {
+			for (int i = 0; i < batch_size; i++) {
+				Mat modified_frame(in_frame_q[i].rows, in_frame_q[i].cols, in_frame_q[i].type(), proc_q[i], in_frame_q[i].step);
+				Mat grayBGR;
+				cvtColor(modified_frame, grayBGR, COLOR_GRAY2BGR);
+
+				Mat frames[2] = { prev_in_frame_q[i], grayBGR };
+				Mat canvas;
+				hconcat(frames, 2, canvas);
+
+
+				imshow("ThisVideo", grayBGR);
+
+				auto t_end = std::chrono::high_resolution_clock::now();
+				if (std::chrono::duration<double, std::milli>(t_end - t_start).count() < 10000) {
+					count_fps++;
+				}
+				else {
+					v_fps.push_back(count_fps / 10);
+					count_fps = 0;
+				}
+
+				int keyPressed = waitKey(delay);
+				if (keyPressed == 27) {
+					cout << endl;
+					cout << "Frame rate achieved : " << std::accumulate(v_fps.begin(), v_fps.end(), 0.0) / v_fps.size() << endl;
+					cout << "ESC pressed" << endl;
+					waitKey(0);
+					break;
+				}
+				else if (keyPressed != -1) {
+					currentTime = capVideo.get(CV_CAP_PROP_POS_MSEC) + startTime;
+					capVideo.set(CV_CAP_PROP_POS_MSEC, currentTime);
+					cout << "Pressed=" << keyPressed << " : Forwarding the video by 60s" << endl;
+				}
+			}
+			cout << "frames rendered" << endl;
 		}
 
+		
+		
 
-		unsigned char *new_frame =  invokeKernel(&frameArray[0], frame.rows, frame.cols);
-		Mat modified_frame(frame.rows, frame.cols, frame.type(), new_frame, frame.step);
+//		unsigned char* i_frame = new unsigned char[rows*columns];
+//		memcpy(i_frame, frame.datastart, (frame.dataend - frame.datastart) * sizeof(unsigned char))
+		prev_in_frame_q.swap(in_colorframe_q);
+		
+		in_colorframe_q.clear();
+		in_frame_q.clear();
 
+		for (int i = 0; i < batch_size; i++) {
+
+			Mat colorframe;
+			capVideo >> colorframe;
+			if (colorframe.empty()) {
+				break;
+			}
+
+			Mat frame;
+			cvtColor(colorframe, frame, COLOR_BGR2GRAY);
+			in_colorframe_q.push_back(colorframe);
+			in_frame_q.push_back(frame);
+
+				
+		}
+		cout << "frames collected" << endl;
+		
+		
+	
+
+		cudaDeviceSynchronize();
+		cout << "synchronized batch" << endl;
+		proc_q.swap(out_frame_q);
+
+		out_frame_q.clear();
+		out_frame_q.resize(batch_size);
+
+		for (int i = 0; i < batch_size; i++) {
+				cudaFree(vec_dev_mat[i].d_frame);			
+				cudaFree(vec_dev_mat[i].d_out_gaussian);
+				cudaFree(vec_dev_mat[i].d_out_sobel_x);	
+				cudaFree(vec_dev_mat[i].d_out_sobel_y);	
+				cudaFree(vec_dev_mat[i].d_out_sobel_grad);
+				cudaFree(vec_dev_mat[i].d_out_suppress);
+				cudaFree(vec_dev_mat[i].d_out_hys_high);	
+				cudaFree(vec_dev_mat[i].d_strong_edge_mask);
+				cudaFree(vec_dev_mat[i].d_out_hys_low);
+				out_frame_q[i] = new unsigned char[in_frame_q[i].rows * in_frame_q[i].cols]();
+		}
+		
+		cout << "synchronization complete" << endl;
+
+		flag = 1;
 		/*Mat modified_frame;
 		Canny(frame, modified_frame, 35, 90);*/
 
@@ -410,11 +538,7 @@ int loadVideo() {
 		//mVideo << modified_frame;
 
 		/*Mat canvas = Mat::zeros(frame.rows, frame.cols * 2 + 10, frame.type());*/
-		Mat grayBGR;
-		cvtColor(modified_frame, grayBGR, COLOR_GRAY2BGR);
-		Mat frames[2] = { colorframe, grayBGR };
-		Mat canvas;
-		hconcat(frames, 2, canvas);
+		
 
 
 		/*colorframe.copyTo(canvas(Range::all(), Range(0, frame.cols)));
@@ -422,34 +546,7 @@ int loadVideo() {
 
 		//resize(canvas, canvas, Size(canvas.cols / 2, canvas.rows / 2));
 
-		imshow("ThisVideo", canvas);
-
-		auto t_end = std::chrono::high_resolution_clock::now();
-
-		//cout << endl << std::chrono::duration<double, std::milli>(t_end - t_start).count();
-		if (std::chrono::duration<double, std::milli>(t_end - t_start).count() < 10000) {
-			count_fps++;
-		}
-		else {
-			v_fps.push_back(count_fps/10);
-			count_fps = 0;
-		}
-
-		int keyPressed = waitKey(3);
-		if (keyPressed == 27) {
-			cout << endl;
-			std::vector<float> v{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-			//cout << "Frame rate achieved : " << std::accumulate(v.begin(), v.end(), 0.0) / v.size() << endl;
-			cout << "Frame rate achieved : " << std::accumulate(v_fps.begin(), v_fps.end(), 0.0) / v_fps.size() << endl;
-			cout << "ESC pressed" << endl;
-			waitKey(0);
-			break;
-		}
-		else if (keyPressed != -1) {
-			currentTime = capVideo.get(CV_CAP_PROP_POS_MSEC) + startTime;
-			capVideo.set(CV_CAP_PROP_POS_MSEC, currentTime);
-			cout << "Pressed=" << keyPressed << " : Forwarding the video by 60s" << endl;
-		}
+		
 	}
 
 	waitKey(0); // Wait for any keystroke in the window
@@ -459,7 +556,7 @@ int loadVideo() {
 }
 
 
-unsigned char* invokeKernel(unsigned char *frame, int rows, int cols) {
+void invokeKernel(unsigned char* in_frame, unsigned char* out_frame, struct dev_mats &vec_dev_mat, int rows, int cols, cudaStream_t &stream) {
 	cudaError_t cudaStatus;
 
 	// Choose which GPU to run on, change this on a multi-GPU system.
@@ -470,84 +567,64 @@ unsigned char* invokeKernel(unsigned char *frame, int rows, int cols) {
 		exit(1);
 	}
 
-	unsigned char *frame_out = new unsigned char[rows*cols];
-	/*int sobel_x[5][5] = { 
-		{2, 1, 0, -1, 2}, 
-		{3, 2, 0, -2, -3},
-		{4, 3, 0, -3, -4},
-		{3, 2, 0, -2, -3},
-		{2, 1, 0, -1, -2} 
-	};
-	int sobel_y[5][5] = { 
-		{ 2 ,3 ,4, 3, 2 },
-		{ 1, 2, 3, 2 ,1 },
-		{ 0, 0, 0, 0, 0 },
-		{ -1, -2, -3, -2, -1 },
-		{ -2, -3, -4, -3, -2}
-	};*/
-		
-
 	// Allocate GPU buffers for two vectors (one input, one output)
-	unsigned char *d_frame, *d_out_gaussian, *d_out_suppress, *d_out_sobel_grad, *d_out_hys_high, *d_out_hys_low;
-	int *d_out_sobel_x, *d_out_sobel_y, *d_strong_edge_mask;
-
-	cudaStatus = cudaMalloc((void**)&d_frame, rows*cols * sizeof(unsigned char));
+	cudaStatus = cudaMalloc((void**)&vec_dev_mat.d_frame, rows*cols * sizeof(unsigned char));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		waitKey(0);
 		exit(1);
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_out_gaussian, rows*cols * sizeof(unsigned char));
+	cudaStatus = cudaMalloc((void**)&vec_dev_mat.d_out_gaussian, rows*cols * sizeof(unsigned char));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		waitKey(0);
 		exit(1);
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_out_sobel_grad, rows*cols * sizeof(uchar));
+	cudaStatus = cudaMalloc((void**)&vec_dev_mat.d_out_sobel_grad, rows*cols * sizeof(uchar));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		waitKey(0);
 		exit(1);
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_out_sobel_x, rows*cols * sizeof(int));
+	cudaStatus = cudaMalloc((void**)&vec_dev_mat.d_out_sobel_x, rows*cols * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		waitKey(0);
 		exit(1);
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_out_sobel_y, rows*cols * sizeof(int));
+	cudaStatus = cudaMalloc((void**)&vec_dev_mat.d_out_sobel_y, rows*cols * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		waitKey(0);
 		exit(1);
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_out_suppress, rows*cols * sizeof(unsigned char));
+	cudaStatus = cudaMalloc((void**)&vec_dev_mat.d_out_suppress, rows*cols * sizeof(unsigned char));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		waitKey(0);
 		exit(1);
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_out_hys_high, rows*cols * sizeof(unsigned char));
+	cudaStatus = cudaMalloc((void**)&vec_dev_mat.d_out_hys_high, rows*cols * sizeof(unsigned char));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		waitKey(0);
 		exit(1);
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_out_hys_low, rows*cols * sizeof(unsigned char));
+	cudaStatus = cudaMalloc((void**)&vec_dev_mat.d_out_hys_low, rows*cols * sizeof(unsigned char));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		waitKey(0);
 		exit(1);
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_strong_edge_mask, rows*cols * sizeof(int));
+	cudaStatus = cudaMalloc((void**)&vec_dev_mat.d_strong_edge_mask, rows*cols * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		waitKey(0);
@@ -555,7 +632,8 @@ unsigned char* invokeKernel(unsigned char *frame, int rows, int cols) {
 	}
 
 	// Copy input vectors from host memory to GPU buffers.
-	cudaStatus = cudaMemcpy(d_frame, frame, rows*cols * sizeof(unsigned char), cudaMemcpyHostToDevice);
+
+	cudaStatus = cudaMemcpyAsync(vec_dev_mat.d_frame, in_frame, rows*cols * sizeof(unsigned char), cudaMemcpyHostToDevice, stream);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy failed!");
 		waitKey(0);
@@ -569,13 +647,13 @@ unsigned char* invokeKernel(unsigned char *frame, int rows, int cols) {
 	const dim3 gridDimHist(ceil((float)cols / blockDimHist.x), ceil((float)rows / blockDimHist.y), 1);
 
 	// Launch a kernel on the GPU for sobel filtering
-	applyFiltersGaussian << <gridDimHist, blockDimHist, blockDimHist.x * blockDimHist.y * sizeof(uchar) >> >(d_frame, cols, rows, 5, d_out_gaussian);
-	applyFiltersSobel << <gridDimHist, blockDimHist, blockDimHist.x * blockDimHist.y * sizeof(uchar) >> >(d_out_gaussian, cols, rows, 3, 
-																										  d_out_sobel_x, d_out_sobel_y, d_out_sobel_grad);
-	cuSuppressNonMax << <blocksPerGrid, threadsPerBlock>> > (d_out_sobel_grad, d_out_sobel_x, d_out_sobel_y,
-   														   d_out_suppress, rows, cols);
-	cuHysteresisHigh << <blocksPerGrid, threadsPerBlock >> > (d_out_hys_high, d_out_suppress, d_strong_edge_mask, 90, rows, cols);
-	cuHysteresisLow << <blocksPerGrid, threadsPerBlock >> > (d_out_hys_low, d_out_hys_high, d_strong_edge_mask, 35, rows, cols);
+	applyFiltersGaussian << <gridDimHist, blockDimHist, blockDimHist.x * blockDimHist.y * sizeof(uchar), stream >> >(vec_dev_mat.d_frame, cols, rows, 5, vec_dev_mat.d_out_gaussian);
+	applyFiltersSobel << <gridDimHist, blockDimHist, blockDimHist.x * blockDimHist.y * sizeof(uchar), stream >> >(vec_dev_mat.d_out_gaussian, cols, rows, 3,
+																										vec_dev_mat.d_out_sobel_x, vec_dev_mat.d_out_sobel_y, vec_dev_mat.d_out_sobel_grad);
+	cuSuppressNonMax << <blocksPerGrid, threadsPerBlock, 0, stream>> > (vec_dev_mat.d_out_sobel_grad, vec_dev_mat.d_out_sobel_x, vec_dev_mat.d_out_sobel_y,
+		vec_dev_mat.d_out_suppress, rows, cols);
+	cuHysteresisHigh << <blocksPerGrid, threadsPerBlock,0, stream >> > (vec_dev_mat.d_out_hys_high, vec_dev_mat.d_out_suppress, vec_dev_mat.d_strong_edge_mask, 90, rows, cols);
+	cuHysteresisLow << <blocksPerGrid, threadsPerBlock,0, stream >> > (vec_dev_mat.d_out_hys_low, vec_dev_mat.d_out_hys_high, vec_dev_mat.d_strong_edge_mask, 35, rows, cols);
 
 	// Check for any errors launching the kernel
 	cudaStatus = cudaGetLastError();
@@ -586,18 +664,17 @@ unsigned char* invokeKernel(unsigned char *frame, int rows, int cols) {
 	}
 
 	// Copy output vector from GPU buffer to host memory.
-	cudaStatus = cudaMemcpy(frame_out, d_out_hys_low, rows*cols * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+	cudaStatus = cudaMemcpyAsync(out_frame, vec_dev_mat.d_out_hys_low, rows*cols * sizeof(unsigned char), cudaMemcpyDeviceToHost, stream);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy failed!");
 		waitKey(0);
 		exit(1);
 	}
 
-	cudaFree(d_frame);			cudaFree(d_out_gaussian);
-	cudaFree(d_out_sobel_x);	cudaFree(d_out_sobel_y);	cudaFree(d_out_sobel_grad);
-	cudaFree(d_out_suppress);
-	cudaFree(d_out_hys_high);	cudaFree(d_strong_edge_mask);
-	cudaFree(d_out_hys_low);
+	//cudaFree(d_frame);			cudaFree(d_out_gaussian);
+	//cudaFree(d_out_sobel_x);	cudaFree(d_out_sobel_y);	cudaFree(d_out_sobel_grad);
+	//cudaFree(d_out_suppress);
+	//cudaFree(d_out_hys_high);	cudaFree(d_strong_edge_mask);
+	//cudaFree(d_out_hys_low);
 
-	return frame_out;
 }
