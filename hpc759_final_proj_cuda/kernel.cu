@@ -384,10 +384,10 @@ int loadVideo(string path) {
 	//}
 
 	double fps = capVideo.get(CV_CAP_PROP_FPS);
-	double startTime = 70000;
+	double startTime = 1;
 	double currentTime = startTime;
 	capVideo.set(CV_CAP_PROP_POS_MSEC, startTime);
-	cout << "Frames per second: " << fps << endl;
+	//cout << "Frames per second: " << fps << endl;
 	
 
 	vector<float> v_fps;
