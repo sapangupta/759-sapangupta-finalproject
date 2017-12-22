@@ -1,3 +1,14 @@
+/////////////////////////////////////////////////////////////////////////////
+// Semester:         ME759 Fall 2017 
+// PROJECT:          GPU Accelerated Edge Detection in Video
+// FILE:             kernel.cu
+//
+// TEAM:    
+// Authors: 
+// Author1: Nikhil S. Nakhate, nakhate@wisc.edu,
+// Author2: Sapan Gupta, sgupta223@wisc.edu
+//
+//////////////////////////// /////////// //////////////////////////////////
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -26,8 +37,9 @@ using namespace std;
 __constant__ int c_sobel_x[3][3];
 __constant__ int c_sobel_y[3][3];
 __constant__ int c_gaussian[5][5];
-
 const string window_name = "This";
+
+// Structure for device pointers used between the kernel calls
 struct dev_mats {
 	unsigned char *d_frame, *d_out_gaussian, *d_out_suppress, *d_out_sobel_grad, *d_out_hys_high, *d_out_hys_low;
 	int *d_out_sobel_x, *d_out_sobel_y, *d_strong_edge_mask;
@@ -52,8 +64,9 @@ int gaussian[5][5] = {
 	{ 2, 4, 5, 4, 2 },
 };
 
-
+// This method streams the video frame by frame in batches to the device kernels and renders them using OpenCV APIs
 int loadVideo(string path);
+// This is the powerhouse method which invokes all the device kernels
 void invokeKernel(unsigned char* in_frame, unsigned char* out_frame, struct dev_mats &vec_dev_mat, int rows, int cols, cudaStream_t &stream);
 
 
@@ -343,15 +356,16 @@ int main(int argc, char** argv)
 		std::cout << "No CLI argument provided.";
 		exit(1);
 	}
+	// Accepts video path as command line argument
 	string path = argv[1];
-
+	
+	// Transfers the filter kernels in the device constant memory
 	setConvolutionKernelsInDeviceConstantMem();
 	
+	// Triggers the video processing for edge detection
 	loadVideo(path);
 	return 0;
 }
-
-
 
 
 int loadVideo(string path) {
@@ -367,21 +381,9 @@ int loadVideo(string path) {
 		return -1;
 	}
 
-
 	Size S = Size((int)capVideo.get(CV_CAP_PROP_FRAME_WIDTH),    // Acquire input size
 		(int)capVideo.get(CV_CAP_PROP_FRAME_HEIGHT));
 	int ex = static_cast<int>(capVideo.get(CV_CAP_PROP_FOURCC));
-
-	//VideoWriter bVideo, gVideo, rVideo, mVideo;
-	//gVideo.open("grey.avi", -1, capVideo.get(CV_CAP_PROP_FPS), S, true);
-	//mVideo.open("modified.avi", -1, capVideo.get(CV_CAP_PROP_FPS), S, true);
-
-	//if (!gVideo.isOpened() || !mVideo.isOpened())
-	//{
-	//	cout << "Could not open the output video for write." << endl;
-	//	waitKey(0);
-	//	return -1;
-	//}
 
 	double fps = capVideo.get(CV_CAP_PROP_FPS);
 	double startTime = 1;
@@ -407,30 +409,25 @@ int loadVideo(string path) {
 	int frame_empty = 0;
 	namedWindow(window_name, CV_WINDOW_NORMAL);
 	while (1) {
-
 		if (count_fps == 0.0) {
 			t_start = std::chrono::high_resolution_clock::now();
 		}
-
 		if (count_fps1 == 0.0) {
 			t_start1 = std::chrono::high_resolution_clock::now();
 		}
 
 		if (flag == 0) {
 			for (int i = 0; i < batch_size; i++) {
-
 				Mat colorframe;
 				capVideo >> colorframe;
 				if (colorframe.empty()) {
 					frame_empty = 1;
 					break;
 				}
-
 				Mat frame;
 				cvtColor(colorframe, frame, COLOR_BGR2GRAY);
 				in_colorframe_q.push_back(colorframe);
 				in_frame_q.push_back(frame);
-
 				out_frame_q[i] = new unsigned char[frame.rows * frame.cols]();
 			}
 			if (frame_empty == 1)
@@ -438,7 +435,6 @@ int loadVideo(string path) {
 			//cout << "frames collected" << endl;
 		}
 
-		//gVideo << frame;
 #pragma omp parallel for
 		for (int i = 0; i < batch_size; i++) {
 			vector<unsigned char> i_frame(in_frame_q[i].rows*in_frame_q[i].cols);
@@ -500,8 +496,6 @@ int loadVideo(string path) {
 			//cout << "frames rendered" << endl;
 		}
 
-//		unsigned char* i_frame = new unsigned char[rows*columns];
-//		memcpy(i_frame, frame.datastart, (frame.dataend - frame.datastart) * sizeof(unsigned char))
 		prev_in_frame_q.swap(in_colorframe_q);
 		
 		in_colorframe_q.clear();
@@ -521,9 +515,6 @@ int loadVideo(string path) {
 		}
 		//cout << "frames collected" << endl;
 		
-		
-	
-
 		cudaDeviceSynchronize();
 		//cout << "synchronized batch" << endl;
 		proc_q.swap(out_frame_q);
@@ -548,21 +539,7 @@ int loadVideo(string path) {
 
 		flag = 1;
 		/*Mat modified_frame;
-		Canny(frame, modified_frame, 35, 90);*/
-
-
-		//mVideo << modified_frame;
-
-		/*Mat canvas = Mat::zeros(frame.rows, frame.cols * 2 + 10, frame.type());*/
-		
-
-
-		/*colorframe.copyTo(canvas(Range::all(), Range(0, frame.cols)));
-		modified_frame.copyTo(canvas(Range::all(), Range(frame.cols+10, frame.cols *2 + 10)));*/
-
-		//resize(canvas, canvas, Size(canvas.cols / 2, canvas.rows / 2));
-
-		
+		Canny(frame, modified_frame, 35, 90);*/		
 	}
 
 	waitKey(0); // Wait for any keystroke in the window
@@ -648,7 +625,6 @@ void invokeKernel(unsigned char* in_frame, unsigned char* out_frame, struct dev_
 	}
 
 	// Copy input vectors from host memory to GPU buffers.
-
 	cudaStatus = cudaMemcpyAsync(vec_dev_mat.d_frame, in_frame, rows*cols * sizeof(unsigned char), cudaMemcpyHostToDevice, stream);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy failed!");
@@ -662,7 +638,7 @@ void invokeKernel(unsigned char* in_frame, unsigned char* out_frame, struct dev_
 	const dim3 blockDimHist(16, 16, 1);
 	const dim3 gridDimHist(ceil((float)cols / blockDimHist.x), ceil((float)rows / blockDimHist.y), 1);
 
-	// Launch a kernel on the GPU for sobel filtering
+	// Launch kernels on the GPU for Canny Edge detection algorithm
 	applyFiltersGaussian << <gridDimHist, blockDimHist, blockDimHist.x * blockDimHist.y * sizeof(uchar), stream >> >(vec_dev_mat.d_frame, cols, rows, 5, vec_dev_mat.d_out_gaussian);
 	applyFiltersSobel << <gridDimHist, blockDimHist, blockDimHist.x * blockDimHist.y * sizeof(uchar), stream >> >(vec_dev_mat.d_out_gaussian, cols, rows, 3,
 																										vec_dev_mat.d_out_sobel_x, vec_dev_mat.d_out_sobel_y, vec_dev_mat.d_out_sobel_grad);
@@ -686,11 +662,5 @@ void invokeKernel(unsigned char* in_frame, unsigned char* out_frame, struct dev_
 		waitKey(0);
 		exit(1);
 	}
-
-	//cudaFree(d_frame);			cudaFree(d_out_gaussian);
-	//cudaFree(d_out_sobel_x);	cudaFree(d_out_sobel_y);	cudaFree(d_out_sobel_grad);
-	//cudaFree(d_out_suppress);
-	//cudaFree(d_out_hys_high);	cudaFree(d_strong_edge_mask);
-	//cudaFree(d_out_hys_low);
 
 }
